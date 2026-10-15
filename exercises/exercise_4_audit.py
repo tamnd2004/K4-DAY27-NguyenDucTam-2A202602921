@@ -77,6 +77,30 @@ reviewer, each naming the file/function in the diff it is about (e.g. "In auth.p
 passwords instead of bcrypt/argon2?"). For the other bands return an empty list.
 """
 
+# After escalation, confidence goes back to its PRAnalysis meaning: is the *review* complete and
+# correct? The reviewer's answers close the open questions, so a review that pins down every issue
+# (even blockers) with a concrete fix earns 1.0.
+SYNTHESIZE_SYSTEM_PROMPT = """\
+You are a senior software engineer finalizing a pull-request review. Earlier you were unsure and asked \
+the human reviewer escalation questions; their answers are below. Return the final structured PRAnalysis.
+- summary / risk_factors: update them with what the answers revealed.
+- comments: write the FINAL review comment list from scratch: exactly one comment per distinct problem \
+(never two comments about the same problem - merge the initial analysis's comments into this list), each \
+with its file, line, severity and a concrete fix. Walk this checklist against the diff and write one \
+comment for every item that applies: password hashing algorithm; how tokens/secrets are generated; how \
+tokens/secrets are stored; SQL built with string formatting (injection); hard-coded ids, credentials or \
+URLs; schema changes and the default value given to existing rows; network/IO error handling; missing \
+tests. Security vulnerabilities stay severity "blocker" even when the author promises to fix them - \
+mention their answer in the comment body.
+- confidence (0.0-1.0): now measures ONLY how sure you are that THIS REVIEW is complete and correct - not \
+whether the PR is safe to merge. A PR full of blockers can still get a 1.0 review. The answers resolved \
+the uncertainty that caused the escalation, so if every answer is clear and every applicable checklist \
+item is covered by a comment with a concrete fix, set confidence to 1.0. Use 0.85-0.95 only if an answer \
+is vague or leaves a real question open, and below 0.85 only if an answer contradicts the diff.
+- confidence_reasoning: 1-2 sentences on why the review is (or is not yet) complete.
+- escalation_questions: return an empty list.
+"""
+
 
 def _reviewer() -> str | None:
     return os.environ.get("GITHUB_USER")
@@ -335,12 +359,7 @@ async def node_synthesize(state):
     llm = get_llm().with_structured_output(PRAnalysis)
     with console.status("[dim]LLM refining review with reviewer answers...[/dim]"):
         refined: PRAnalysis = await llm.ainvoke([
-            {"role": "system", "content": (
-                "You are a senior software engineer refining an earlier pull-request review "
-                "using the human reviewer's answers to your escalation questions. Keep every "
-                "genuine issue unless an answer clearly resolves it, add new points the answers "
-                "raise, re-assess confidence honestly, and return escalation_questions empty."
-            )},
+            {"role": "system", "content": SYNTHESIZE_SYSTEM_PROMPT},
             {"role": "user", "content": (
                 f"Title: {state['pr_title']}\n\nDiff:\n{state['pr_diff']}\n\n"
                 f"Initial analysis:\n{initial}\n\nReviewer Q&A:\n{qa}"
