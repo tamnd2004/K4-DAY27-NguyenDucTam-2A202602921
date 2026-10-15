@@ -23,23 +23,27 @@ from common.db import db_conn, replay_events
 RISK_COLOR = {"low": "green", "med": "yellow", "high": "red"}
 
 
+# worst_risk uses an explicit ranking: MAX() over the text values is lexicographic.
+RECENT_SESSIONS_SQL = """
+    SELECT thread_id,
+           pr_url,
+           MIN(timestamp)        AS started,
+           MAX(timestamp)        AS last_event,
+           CASE MAX(CASE risk_level WHEN 'high' THEN 3 WHEN 'med' THEN 2 WHEN 'low' THEN 1 ELSE 0 END)
+                WHEN 3 THEN 'high' WHEN 2 THEN 'med' WHEN 1 THEN 'low' ELSE NULL
+           END                   AS worst_risk,
+           COUNT(*)              AS events
+      FROM audit_events
+     GROUP BY thread_id, pr_url
+     ORDER BY MAX(timestamp) DESC
+     LIMIT 25
+"""
+
+
 async def list_threads() -> None:
     console = Console()
     async with db_conn() as conn:
-        async with conn.execute(
-            """
-            SELECT thread_id,
-                   pr_url,
-                   MIN(timestamp)        AS started,
-                   MAX(timestamp)        AS last_event,
-                   MAX(risk_level)       AS worst_risk,
-                   COUNT(*)              AS events
-              FROM audit_events
-             GROUP BY thread_id, pr_url
-             ORDER BY MAX(timestamp) DESC
-             LIMIT 25
-            """
-        ) as cur:
+        async with conn.execute(RECENT_SESSIONS_SQL) as cur:
             rows = await cur.fetchall()
 
     table = Table(title="Recent review sessions")

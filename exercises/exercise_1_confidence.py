@@ -26,6 +26,29 @@ from common.schemas import (
 
 console = Console()
 
+# Calibrated against openai/gpt-4o-mini on the demo PRs: the skeleton prompt rated
+# everything 0.80-0.85 (auto_approve); this one spreads PRs across the three buckets.
+REVIEW_SYSTEM_PROMPT = """\
+You are a senior software engineer reviewing a GitHub pull request. Return a structured PRAnalysis.
+- summary: one paragraph on what the PR does.
+- risk_factors: concrete risks (security, data loss, schema/migration, missing tests, hard-coded values).
+- comments: specific review comments tied to a file (and line when known), severity nit|suggestion|issue|blocker.
+- confidence (0.0-1.0): how sure you are that your review is complete and correct AND that this PR could be \
+merged on your review alone, without a human looking. Calibrate honestly using these bands:
+  * AUTO band, 0.80-0.95: small, low-risk change, no open questions, nothing a human must decide.
+  * HUMAN-APPROVAL band, 0.65-0.70: reasonable change, but at least one open design question you cannot resolve from the diff alone \
+(e.g. schema migration / backward compatibility of stored data) -> a human should approve.
+  * ESCALATE band, 0.20-0.50: use this band for any security vulnerability (weak password hashing such as MD5, \
+plaintext secrets or tokens, SQL injection), hard-coded credentials or user ids, network/sync code without tests, \
+or when the intent cannot be inferred.
+  Hard rule: if any of your comments has severity "blocker", or any risk factor is a security vulnerability, \
+confidence MUST be 0.50 or lower.
+- confidence_reasoning: 1-3 sentences justifying the number, naming the band you chose (AUTO, HUMAN-APPROVAL or ESCALATE).
+- escalation_questions: only when you chose the ESCALATE band, write 2-4 specific, context-rich questions for the \
+reviewer, each naming the file/function in the diff it is about (e.g. "In auth.py, why is MD5 used to hash \
+passwords instead of bcrypt/argon2?"). For the other bands return an empty list.
+"""
+
 
 def node_fetch_pr(state: ReviewState) -> dict:
     console.print("[cyan]→ fetch_pr[/cyan]")
@@ -40,22 +63,24 @@ def node_fetch_pr(state: ReviewState) -> dict:
 
 def node_analyze(state: ReviewState) -> dict:
     console.print("[cyan]→ analyze[/cyan]")
-    # TODO: call the LLM with structured output PRAnalysis.
-    # Hint:  llm = get_llm().with_structured_output(PRAnalysis)
-    #        analysis = llm.invoke([...])
-    #        return {"analysis": analysis}
-    # When implemented, wrap the call in:
-    #        with console.status("[dim]LLM thinking...[/dim]"):
-    #            analysis = llm.invoke([...])
-    raise NotImplementedError("Implement node_analyze")
+    llm = get_llm().with_structured_output(PRAnalysis)
+    with console.status("[dim]LLM thinking...[/dim]"):
+        analysis = llm.invoke([
+            {"role": "system", "content": REVIEW_SYSTEM_PROMPT},
+            {"role": "user", "content": f"Title: {state['pr_title']}\nDiff:\n{state['pr_diff']}"},
+        ])
+    console.print(f"  [green]✓[/green] confidence={analysis.confidence:.0%}, {len(analysis.comments)} comment(s)")
+    return {"analysis": analysis}
 
 
 def node_route(state: ReviewState) -> dict:
     console.print("[cyan]→ route[/cyan]")
-    # TODO: read state["analysis"].confidence and return
-    #       {"decision": "auto_approve" | "human_approval" | "escalate"}
-    # Thresholds provided: AUTO_APPROVE_THRESHOLD (0.85) and ESCALATE_THRESHOLD (0.60).
-    raise NotImplementedError("Implement node_route")
+    c = state["analysis"].confidence
+    if c >= AUTO_APPROVE_THRESHOLD: decision = "auto_approve"
+    elif c < ESCALATE_THRESHOLD:    decision = "escalate"
+    else:                           decision = "human_approval"
+    console.print(f"  [green]✓[/green] decision=[bold]{decision}[/bold] (confidence={c:.0%})")
+    return {"decision": decision}
 
 
 def node_auto_approve(state: ReviewState) -> dict:
@@ -75,11 +100,21 @@ def node_escalate(state: ReviewState) -> dict:
 
 def build_graph():
     g = StateGraph(ReviewState)
-    # TODO: add_node for the 6 nodes above (fetch_pr, analyze, route, auto_approve, human_approval, escalate)
-    # TODO: add_edge from START → fetch_pr → analyze → route
-    # TODO: add_conditional_edges on "route" with mapping
-    #       {"auto_approve": "auto_approve", "human_approval": "human_approval", "escalate": "escalate"}
-    # TODO: add_edge from each terminal node → END
+    for name, fn in [
+        ("fetch_pr", node_fetch_pr), ("analyze", node_analyze), ("route", node_route),
+        ("auto_approve", node_auto_approve), ("human_approval", node_human_approval),
+        ("escalate", node_escalate),
+    ]:
+        g.add_node(name, fn)
+    g.add_edge(START, "fetch_pr")
+    g.add_edge("fetch_pr", "analyze")
+    g.add_edge("analyze", "route")
+    g.add_conditional_edges(
+        "route", lambda s: s["decision"],
+        {"auto_approve": "auto_approve", "human_approval": "human_approval", "escalate": "escalate"},
+    )
+    for terminal in ("auto_approve", "human_approval", "escalate"):
+        g.add_edge(terminal, END)
     return g.compile()
 
 

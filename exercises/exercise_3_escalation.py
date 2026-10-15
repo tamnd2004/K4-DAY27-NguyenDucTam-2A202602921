@@ -1,6 +1,6 @@
 """Exercise 3 — Escalation branch with reviewer Q&A.
 
-When confidence < 60%, the agent doesn't ask approve/reject — it asks specific
+When confidence < ESCALATE_THRESHOLD, the agent doesn't ask approve/reject — it asks specific
 clarifying questions and then synthesizes a refined review from the answers.
 """
 
@@ -28,6 +28,29 @@ from common.schemas import (
 
 console = Console()
 
+# Calibrated against openai/gpt-4o-mini on the demo PRs: the skeleton prompt rated
+# everything 0.80-0.85 (auto_approve); this one spreads PRs across the three buckets.
+REVIEW_SYSTEM_PROMPT = """\
+You are a senior software engineer reviewing a GitHub pull request. Return a structured PRAnalysis.
+- summary: one paragraph on what the PR does.
+- risk_factors: concrete risks (security, data loss, schema/migration, missing tests, hard-coded values).
+- comments: specific review comments tied to a file (and line when known), severity nit|suggestion|issue|blocker.
+- confidence (0.0-1.0): how sure you are that your review is complete and correct AND that this PR could be \
+merged on your review alone, without a human looking. Calibrate honestly using these bands:
+  * AUTO band, 0.80-0.95: small, low-risk change, no open questions, nothing a human must decide.
+  * HUMAN-APPROVAL band, 0.65-0.70: reasonable change, but at least one open design question you cannot resolve from the diff alone \
+(e.g. schema migration / backward compatibility of stored data) -> a human should approve.
+  * ESCALATE band, 0.20-0.50: use this band for any security vulnerability (weak password hashing such as MD5, \
+plaintext secrets or tokens, SQL injection), hard-coded credentials or user ids, network/sync code without tests, \
+or when the intent cannot be inferred.
+  Hard rule: if any of your comments has severity "blocker", or any risk factor is a security vulnerability, \
+confidence MUST be 0.50 or lower.
+- confidence_reasoning: 1-3 sentences justifying the number, naming the band you chose (AUTO, HUMAN-APPROVAL or ESCALATE).
+- escalation_questions: only when you chose the ESCALATE band, write 2-4 specific, context-rich questions for the \
+reviewer, each naming the file/function in the diff it is about (e.g. "In auth.py, why is MD5 used to hash \
+passwords instead of bcrypt/argon2?"). For the other bands return an empty list.
+"""
+
 
 def node_fetch_pr(state):
     console.print("[cyan]→ fetch_pr[/cyan]")
@@ -42,11 +65,7 @@ def node_analyze(state):
     llm = get_llm().with_structured_output(PRAnalysis)
     with console.status("[dim]LLM reviewing the diff...[/dim]"):
         analysis = llm.invoke([
-            {"role": "system", "content": (
-                "Senior reviewer. Structured output. "
-                # TODO: add an instruction: if confidence < 60%, populate escalation_questions
-                # with 2–4 specific, context-rich questions (reference which file/section in the diff).
-            )},
+            {"role": "system", "content": REVIEW_SYSTEM_PROMPT},
             {"role": "user", "content": f"Title: {state['pr_title']}\nDiff:\n{state['pr_diff']}"},
         ])
     console.print(f"  [green]✓[/green] confidence={analysis.confidence:.0%}, {len(analysis.escalation_questions)} question(s)")
@@ -71,22 +90,38 @@ def node_escalate(state: ReviewState) -> dict:
         # fallback when the LLM didn't generate any questions
         questions = ["What is the intent of this PR?", "Any migration concerns?"]
 
-    # TODO: call interrupt(payload) where payload kind="escalation" contains:
-    #       pr_url, confidence, confidence_reasoning, summary, risk_factors, questions.
-    # answers = interrupt({...})
-    # return {"escalation_answers": answers}
-    raise NotImplementedError("Call interrupt() with an escalation payload")
+    answers = interrupt({
+        "kind": "escalation", "pr_url": state["pr_url"],
+        "confidence": a.confidence, "confidence_reasoning": a.confidence_reasoning,
+        "summary": a.summary, "risk_factors": a.risk_factors, "questions": questions,
+    })
+    return {"escalation_answers": answers}
 
 
 def node_synthesize(state: ReviewState) -> dict:
     """Re-prompt LLM with the reviewer's answers and produce a refined review."""
-    # TODO:
-    #   - read state["escalation_answers"] (dict[question, answer])
-    #   - call get_llm().with_structured_output(PRAnalysis).invoke(...) with a prompt
-    #     containing the original diff + initial analysis + Q&A.
-    #   - return {"analysis": refined}
-    # `node_commit` will then post the refined review to the PR.
-    raise NotImplementedError("Synthesize a refined PRAnalysis using the reviewer answers")
+    console.print("[cyan]→ synthesize[/cyan]")
+    a = state["analysis"]
+    qa = "\n".join(f"Q: {q}\nA: {ans}" for q, ans in state["escalation_answers"].items())
+    user = (
+        f"Title: {state['pr_title']}\nDiff:\n{state['pr_diff']}\n\n"
+        f"Initial analysis:\nSummary: {a.summary}\n"
+        f"Risk factors: {'; '.join(a.risk_factors) or 'none'}\n"
+        "Comments:\n" + "\n".join(f"- [{c.severity}] {c.file}:{c.line or '?'} — {c.body}" for c in a.comments) + "\n"
+        f"Confidence: {a.confidence:.2f} — {a.confidence_reasoning}\n\n"
+        f"Reviewer answers to the open questions:\n{qa}"
+    )
+    system = (
+        "You are a senior reviewer refining an earlier PR review using the human reviewer's answers. "
+        "The answers resolve the open questions: update the summary, risk factors and comments accordingly. "
+        "Keep real issues (e.g. MD5 hashing, SQL injection) unless an answer genuinely resolves them. "
+        "Re-assess confidence given the new context. Return escalation_questions as an empty list."
+    )
+    llm = get_llm().with_structured_output(PRAnalysis)
+    with console.status("[dim]LLM refining the review...[/dim]"):
+        refined = llm.invoke([{"role": "system", "content": system}, {"role": "user", "content": user}])
+    console.print(f"  [green]✓[/green] refined confidence={refined.confidence:.0%}, {len(refined.comments)} comment(s)")
+    return {"analysis": refined}
 
 
 def node_human_approval(state):
@@ -161,7 +196,8 @@ def build_graph():
     g.add_edge("auto_approve", END)
     g.add_edge("human_approval", "commit")
     g.add_edge("commit", END)
-    # TODO: wire escalate → synthesize → commit  (commit already → END)
+    g.add_edge("escalate", "synthesize")
+    g.add_edge("synthesize", "commit")
     return g.compile(checkpointer=MemorySaver())
 
 

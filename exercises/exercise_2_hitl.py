@@ -29,6 +29,29 @@ from common.schemas import (
 
 console = Console()
 
+# Calibrated against openai/gpt-4o-mini on the demo PRs: the skeleton prompt rated
+# everything 0.80-0.85 (auto_approve); this one spreads PRs across the three buckets.
+REVIEW_SYSTEM_PROMPT = """\
+You are a senior software engineer reviewing a GitHub pull request. Return a structured PRAnalysis.
+- summary: one paragraph on what the PR does.
+- risk_factors: concrete risks (security, data loss, schema/migration, missing tests, hard-coded values).
+- comments: specific review comments tied to a file (and line when known), severity nit|suggestion|issue|blocker.
+- confidence (0.0-1.0): how sure you are that your review is complete and correct AND that this PR could be \
+merged on your review alone, without a human looking. Calibrate honestly using these bands:
+  * AUTO band, 0.80-0.95: small, low-risk change, no open questions, nothing a human must decide.
+  * HUMAN-APPROVAL band, 0.65-0.70: reasonable change, but at least one open design question you cannot resolve from the diff alone \
+(e.g. schema migration / backward compatibility of stored data) -> a human should approve.
+  * ESCALATE band, 0.20-0.50: use this band for any security vulnerability (weak password hashing such as MD5, \
+plaintext secrets or tokens, SQL injection), hard-coded credentials or user ids, network/sync code without tests, \
+or when the intent cannot be inferred.
+  Hard rule: if any of your comments has severity "blocker", or any risk factor is a security vulnerability, \
+confidence MUST be 0.50 or lower.
+- confidence_reasoning: 1-3 sentences justifying the number, naming the band you chose (AUTO, HUMAN-APPROVAL or ESCALATE).
+- escalation_questions: only when you chose the ESCALATE band, write 2-4 specific, context-rich questions for the \
+reviewer, each naming the file/function in the diff it is about (e.g. "In auth.py, why is MD5 used to hash \
+passwords instead of bcrypt/argon2?"). For the other bands return an empty list.
+"""
+
 
 def node_fetch_pr(state: ReviewState) -> dict:
     console.print("[cyan]→ fetch_pr[/cyan]")
@@ -43,7 +66,7 @@ def node_analyze(state: ReviewState) -> dict:
     llm = get_llm().with_structured_output(PRAnalysis)
     with console.status("[dim]LLM reviewing the diff...[/dim]"):
         analysis = llm.invoke([
-            {"role": "system", "content": "Senior reviewer. Structured output."},
+            {"role": "system", "content": REVIEW_SYSTEM_PROMPT},
             {"role": "user", "content": f"Title: {state['pr_title']}\nDiff:\n{state['pr_diff']}"},
         ])
     console.print(f"  [green]✓[/green] confidence={analysis.confidence:.0%}, {len(analysis.comments)} comment(s)")
@@ -63,17 +86,14 @@ def node_route(state: ReviewState) -> dict:
 def node_human_approval(state: ReviewState) -> dict:
     """Pause and ask the human."""
     a = state["analysis"]
-    # TODO: call interrupt(payload) where payload contains these fields:
-    #         "kind": "approval_request",
-    #         "confidence": a.confidence,
-    #         "confidence_reasoning": a.confidence_reasoning,
-    #         "summary": a.summary,
-    #         "comments": [c.model_dump() for c in a.comments],
-    #         "diff_preview": state["pr_diff"][:2000],
-    # interrupt() returns whatever the caller passes via Command(resume=...).
-    # response = interrupt(...)
-    # return {"human_choice": response["choice"], "human_feedback": response.get("feedback")}
-    raise NotImplementedError("Call interrupt() with an approval_request payload")
+    resp = interrupt({
+        "kind": "approval_request", "pr_url": state["pr_url"],
+        "confidence": a.confidence, "confidence_reasoning": a.confidence_reasoning,
+        "summary": a.summary,
+        "comments": [c.model_dump() for c in a.comments],
+        "diff_preview": state["pr_diff"][:2000],
+    })
+    return {"human_choice": resp.get("choice"), "human_feedback": resp.get("feedback")}
 
 
 def _render_comment_body(state: ReviewState) -> str:
@@ -133,8 +153,7 @@ def build_graph():
     g.add_edge("human_approval", "commit")
     g.add_edge("commit", END)
     g.add_edge("escalate", END)
-    # TODO: compile with checkpointer=MemorySaver()
-    return g.compile()
+    return g.compile(checkpointer=MemorySaver())
 
 
 def prompt_human(payload: dict) -> dict:
@@ -174,12 +193,9 @@ def main() -> None:
 
     result = app.invoke({"pr_url": args.pr, "thread_id": thread_id}, cfg)
 
-    # TODO: write a `while "__interrupt__" in result:` loop:
-    #   - take payload from result["__interrupt__"][0].value
-    #   - call prompt_human(payload)
-    #   - resume with app.invoke(Command(resume=<answer>), cfg)
-    # while "__interrupt__" in result:
-    #     ...
+    while "__interrupt__" in result:
+        payload = result["__interrupt__"][0].value
+        result = app.invoke(Command(resume=prompt_human(payload)), cfg)
 
     console.rule("Done")
     console.print(result.get("final_action"))
